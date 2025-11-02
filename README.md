@@ -1,72 +1,31 @@
-# Hello World MCP Server 👋
+# MCP Learning Game Plan
 
-Your first MCP (Model Context Protocol) server! This server demonstrates the fundamental concepts you need to understand.
+This repository contains a series of MCP servers developed as part of a learning game plan to master the Model Context Protocol (MCP). The project is divided into phases, each focusing on a different aspect of MCP.
 
-## What You're Learning
+## Phases
 
-### 🏗️ **MCP Server Architecture**
-- Server initialization and configuration
-- Client-server handshake process
-- Tool registration and execution
-- Error handling and lifecycle management
+*   **Phase 1: MCP Fundamentals & Setup:** A basic "Hello World" server to understand the fundamentals of MCP.
+*   **Phase 2: Tools Deep Dive:** A more advanced server with a variety of tools, focusing on tool creation, parameter validation, and error handling.
+*   **Phase 3: Resources Mastery:** (In Progress) This phase will focus on understanding and implementing MCP resources.
+*   **Phase 4: Prompts and Templates:** This phase will cover designing and implementing effective prompt templates and libraries.
+- **Phase 5: Advanced Integration Patterns:** This phase will cover building complex multi-server architectures and plugin systems.
+- **Phase 6: Real-World Applications:** This phase will focus on building production-ready MCP servers with security, deployment, and monitoring.
 
-### 🔧 **Tools Implementation**
-This server provides two simple tools:
+## Running the Servers
 
-1. **`say_hello`** - Greets someone by name
-   - Parameters: `name` (string, required)
-   - Returns: Personalized greeting with timestamp
-
-2. **`get_server_info`** - Returns server metadata
-   - Parameters: None
-   - Returns: Server details and runtime information
-
-## Building and Running
+Each phase has its own server located in a corresponding `phaseX-<name>` directory. To run a server, navigate to its directory and use the following commands:
 
 ```bash
-# Build the TypeScript
+# Install dependencies
+npm install
+
+# Build the TypeScript code
 npm run build
 
 # Run the server
 npm start
-
-# Or build and run in one command
-npm run dev
 ```
 
-## Key MCP Concepts Demonstrated
+## GEMINI.md
 
-### 1. **Server Setup**
-```typescript
-const server = new Server(serverInfo, capabilities);
-```
-
-### 2. **Tool Registration**
-```typescript
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return { tools: [...] };
-});
-```
-
-### 3. **Tool Execution**
-```typescript
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  // Handle tool calls
-});
-```
-
-### 4. **Transport Layer**
-```typescript
-const transport = new StdioServerTransport();
-await server.connect(transport);
-```
-
-## What's Next?
-
-After running this server, you'll understand:
-- ✅ How MCP servers are structured
-- ✅ How to define and implement tools
-- ✅ How client-server communication works
-- ✅ Basic error handling patterns
-
-Ready for **Phase 2: Tools Deep Dive**? We'll build more complex tools with validation, async operations, and real-world integrations!
+This project includes a `GEMINI.md` file that serves as a guide for the Gemini agent. It outlines the project's goals, structure, and available tools, ensuring that the agent can assist effectively in the development process.
