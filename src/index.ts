@@ -17,6 +17,16 @@ type CollectContextArgs = {
   recentCommitLimit: number;
 };
 
+type DiffSource = 'staged' | 'working';
+
+type DiffInsightsArgs = {
+  workingDirectory?: string;
+  source: DiffSource;
+  paths?: string[];
+  includePatch: boolean;
+  maxPatchLines: number;
+};
+
 type RepoStatus = {
   branch?: string;
   upstream?: string;
@@ -32,6 +42,25 @@ type RepoContext = {
   repositoryRoot: string;
   status?: RepoStatus;
   recentCommits?: Array<{ hash: string; author: string; relativeDate: string; summary: string }>;
+};
+
+type DiffFileChange = {
+  path: string;
+  changeType: string;
+  additions: number | null;
+  deletions: number | null;
+  isBinary: boolean;
+  previousPath?: string;
+  patch?: string;
+};
+
+type DiffInsights = {
+  repositoryRoot: string;
+  source: DiffSource;
+  fileCount: number;
+  totalAdditions: number;
+  totalDeletions: number;
+  files: DiffFileChange[];
 };
 
 const collectContextInputSchema = {
@@ -55,6 +84,34 @@ const collectContextInputSchema = {
     .max(20)
     .default(5)
     .describe('Number of commits to include when includeRecentCommits is true.'),
+};
+
+const diffInsightsInputSchema = {
+  workingDirectory: z
+    .string()
+    .min(1)
+    .describe('Absolute or relative path whose repository diff should be analysed.')
+    .optional(),
+  source: z
+    .enum(['staged', 'working'] as const)
+    .default('staged')
+    .describe("Select staged (index) or working tree diff against HEAD."),
+  paths: z
+    .array(z.string().min(1))
+    .min(1)
+    .describe('Optional subset of paths to diff. Defaults to all changed files.')
+    .optional(),
+  includePatch: z
+    .boolean()
+    .default(false)
+    .describe('Include a truncated patch excerpt per file.'),
+  maxPatchLines: z
+    .number()
+    .int()
+    .min(10)
+    .max(2000)
+    .default(400)
+    .describe('Maximum number of patch lines retained when includePatch is true.'),
 };
 
 async function main() {
@@ -126,10 +183,61 @@ async function main() {
     }
   );
 
+  server.registerTool(
+    'code-review.diff-insights',
+    {
+      title: 'Summarise repository diffs',
+      description: 'Summarise file changes, churn, and optional patch excerpts for staged or working tree diffs.',
+      inputSchema: diffInsightsInputSchema,
+    },
+    async (rawArgs) => {
+      const args = normalizeDiffInsightsArgs(rawArgs);
+
+      try {
+        const cwd = await resolveWorkingDirectory(args.workingDirectory);
+        const repoRoot = await detectRepositoryRoot(cwd);
+        const insights = await gatherDiffInsights(repoRoot, args);
+        const summary = formatDiffSummary(insights);
+
+        const content = [
+          {
+            type: 'text' as const,
+            text: summary,
+          },
+        ];
+
+        if (args.includePatch) {
+          const patchText = buildPatchAppendix(insights);
+          if (patchText) {
+            content.push({ type: 'text' as const, text: patchText });
+          }
+        }
+
+        return {
+          content,
+          structuredContent: insights,
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `code-review.diff-insights failed: ${message}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
   const transport = new StdioServerTransport();
   console.error('Code Review MCP server starting...');
   await server.connect(transport);
-  console.error('Code Review MCP server ready. Registered tools: code-review.collect-context');
+  console.error(
+    'Code Review MCP server ready. Registered tools: code-review.collect-context, code-review.diff-insights'
+  );
 }
 
 function normalizeCollectContextArgs(raw: Partial<CollectContextArgs> | undefined): CollectContextArgs {
@@ -138,6 +246,16 @@ function normalizeCollectContextArgs(raw: Partial<CollectContextArgs> | undefine
     includeGitStatus: raw?.includeGitStatus ?? true,
     includeRecentCommits: raw?.includeRecentCommits ?? false,
     recentCommitLimit: raw?.recentCommitLimit ?? 5,
+  };
+}
+
+function normalizeDiffInsightsArgs(raw: Partial<DiffInsightsArgs> | undefined): DiffInsightsArgs {
+  return {
+    workingDirectory: raw?.workingDirectory,
+    source: raw?.source ?? 'staged',
+    paths: raw?.paths,
+    includePatch: raw?.includePatch ?? false,
+    maxPatchLines: raw?.maxPatchLines ?? 400,
   };
 }
 
@@ -291,6 +409,258 @@ function formatChangeList(entries: Array<{ status: string; path: string }>): str
   }
 
   return entries.map((entry) => `${entry.status} ${entry.path}`).join(', ');
+}
+
+async function gatherDiffInsights(repoRoot: string, args: DiffInsightsArgs): Promise<DiffInsights> {
+  const nameStatus = await runGitDiff(repoRoot, args, ['--name-status']);
+  const numstat = await runGitDiff(repoRoot, args, ['--numstat']);
+
+  const changeTypeMap = parseNameStatus(nameStatus);
+  const numstatEntries = parseNumstat(numstat);
+
+  const files = mergeDiffData(changeTypeMap, numstatEntries, args);
+  const totals = files.reduce(
+    (acc, file) => {
+      if (typeof file.additions === 'number') {
+        acc.additions += file.additions;
+      }
+      if (typeof file.deletions === 'number') {
+        acc.deletions += file.deletions;
+      }
+      return acc;
+    },
+    { additions: 0, deletions: 0 }
+  );
+
+  if (args.includePatch) {
+    const patchText = await runGitDiff(repoRoot, args, ['--patch', '--unified=3']);
+    attachPatchSnippets(files, patchText, args.maxPatchLines);
+  }
+
+  return {
+    repositoryRoot: repoRoot,
+    source: args.source,
+    fileCount: files.length,
+    totalAdditions: totals.additions,
+    totalDeletions: totals.deletions,
+    files,
+  };
+}
+
+async function runGitDiff(repoRoot: string, args: DiffInsightsArgs, extraFlags: string[]): Promise<string> {
+  const base = ['diff'];
+  if (args.source === 'staged') {
+    base.push('--cached');
+  }
+
+  base.push('--no-color', '--no-ext-diff', ...extraFlags);
+
+  if (args.paths?.length) {
+    base.push('--', ...args.paths);
+  }
+
+  const { stdout } = await execFileAsync('git', base, { cwd: repoRoot, maxBuffer: 10 * 1024 * 1024 });
+  return stdout;
+}
+
+function parseNameStatus(raw: string): Map<string, { changeType: string; previousPath?: string }> {
+  const map = new Map<string, { changeType: string; previousPath?: string }>();
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) {
+      continue;
+    }
+    const [type, ...pathParts] = line.trim().split('\t');
+    if (!type) {
+      continue;
+    }
+
+    if (type.startsWith('R') || type.startsWith('C')) {
+      const previousPath = pathParts[0];
+      const newPath = pathParts[1] ?? previousPath;
+      if (!newPath) {
+        continue;
+      }
+      map.set(newPath, { changeType: type, previousPath });
+    } else {
+      const targetPath = pathParts[0];
+      if (!targetPath) {
+        continue;
+      }
+      map.set(targetPath, { changeType: type });
+    }
+  }
+  return map;
+}
+
+function parseNumstat(raw: string) {
+  const entries: Array<{
+    additions: number | null;
+    deletions: number | null;
+    path: string;
+    previousPath?: string;
+  }> = [];
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) {
+      continue;
+    }
+    const parts = line.trim().split('\t');
+    const additionsRaw = parts[0];
+    const deletionsRaw = parts[1];
+    const rest = parts.slice(2);
+    const path = rest.pop();
+    const previousPath = rest.length ? rest.join('\t') : undefined;
+    if (!path) {
+      continue;
+    }
+    const additions = additionsRaw === '-' ? null : Number.parseInt(additionsRaw, 10) || 0;
+    const deletions = deletionsRaw === '-' ? null : Number.parseInt(deletionsRaw, 10) || 0;
+    entries.push({ additions, deletions, path, previousPath });
+  }
+  return entries;
+}
+
+function mergeDiffData(
+  changeTypeMap: Map<string, { changeType: string; previousPath?: string }>,
+  numstatEntries: Array<{
+    additions: number | null;
+    deletions: number | null;
+    path: string;
+    previousPath?: string;
+  }>,
+  args: DiffInsightsArgs
+): DiffFileChange[] {
+  const fileMap = new Map<string, DiffFileChange>();
+
+  for (const { path, additions, deletions, previousPath } of numstatEntries) {
+    const changeInfo = changeTypeMap.get(path);
+    fileMap.set(path, {
+      path,
+      changeType: changeInfo?.changeType ?? inferChangeType(additions, deletions),
+      additions,
+      deletions,
+      isBinary: additions === null || deletions === null,
+      previousPath: changeInfo?.previousPath ?? previousPath,
+    });
+  }
+
+  for (const [path, info] of changeTypeMap.entries()) {
+    if (fileMap.has(path)) {
+      continue;
+    }
+    fileMap.set(path, {
+      path,
+      changeType: info.changeType,
+      additions: 0,
+      deletions: 0,
+      isBinary: true,
+      previousPath: info.previousPath,
+    });
+  }
+
+  const files = [...fileMap.values()].sort((a, b) => a.path.localeCompare(b.path));
+
+  if (args.paths?.length) {
+    const filter = new Set(args.paths.map((p) => normalizePathForComparison(p)));
+    return files.filter((file) => filter.has(normalizePathForComparison(file.path)));
+  }
+
+  return files;
+}
+
+function inferChangeType(additions: number | null, deletions: number | null): string {
+  if (additions === 0 && deletions === 0) {
+    return 'M';
+  }
+  if (additions !== null && deletions === null) {
+    return 'A';
+  }
+  return 'M';
+}
+
+function attachPatchSnippets(files: DiffFileChange[], rawPatch: string, maxLines: number) {
+  if (!rawPatch.trim()) {
+    return;
+  }
+
+  const segments = splitUnifiedDiff(rawPatch);
+  for (const segment of segments) {
+    const key = normalizePathForComparison(segment.keyPath);
+    const file = files.find((f) => {
+      if (normalizePathForComparison(f.path) === key) {
+        return true;
+      }
+      if (f.previousPath && normalizePathForComparison(f.previousPath) === key) {
+        return true;
+      }
+      return false;
+    });
+    if (!file) {
+      continue;
+    }
+    const lines = segment.patch.split('\n');
+    if (lines.length > maxLines) {
+      file.patch = `${lines.slice(0, maxLines).join('\n')}\n… (truncated)`;
+    } else {
+      file.patch = segment.patch;
+    }
+  }
+}
+
+function splitUnifiedDiff(rawPatch: string): Array<{ keyPath: string; label: string; patch: string }> {
+  const results: Array<{ keyPath: string; label: string; patch: string }> = [];
+  const diffRegex = /^diff --git a\/(.+?) b\/(.+?)\n([\s\S]*?)(?=^diff --git |\s*$)/gm;
+  let match: RegExpExecArray | null;
+
+  while ((match = diffRegex.exec(rawPatch)) !== null) {
+    const [, oldPath, newPath, body] = match;
+    const label = oldPath === newPath ? newPath : `${oldPath} -> ${newPath}`;
+    results.push({
+      keyPath: newPath,
+      label,
+      patch: `diff --git a/${oldPath} b/${newPath}\n${body.trimStart()}`,
+    });
+  }
+
+  return results;
+}
+
+function formatDiffSummary(insights: DiffInsights): string {
+  const lines: string[] = [];
+  lines.push(
+    `Diff source: ${insights.source === 'staged' ? 'staged changes' : 'working tree'} at ${insights.repositoryRoot}`
+  );
+  lines.push(
+    `Files changed: ${insights.fileCount}, total additions: ${insights.totalAdditions}, total deletions: ${insights.totalDeletions}`
+  );
+
+  for (const file of insights.files) {
+    const displayPath = file.previousPath ? `${file.previousPath} -> ${file.path}` : file.path;
+    const churn = file.isBinary
+      ? 'binary file'
+      : `+${file.additions ?? 0} / -${file.deletions ?? 0}`;
+    lines.push(`- ${file.changeType.padEnd(2)} ${displayPath} (${churn})`);
+  }
+
+  return lines.join('\n');
+}
+
+function buildPatchAppendix(insights: DiffInsights): string | undefined {
+  const patches = insights.files
+    .filter((file) => file.patch)
+    .map((file) => {
+      const label = file.previousPath ? `${file.previousPath} -> ${file.path}` : file.path;
+      return `### ${label}\n${file.patch}`;
+    });
+
+  if (!patches.length) {
+    return undefined;
+  }
+
+  return ['## Patch excerpts', ...patches].join('\n\n');
+}
+
+function normalizePathForComparison(p: string): string {
+  return path.posix.normalize(p.replace(/\\/g, '/'));
 }
 
 main().catch((error) => {

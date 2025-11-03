@@ -16,6 +16,9 @@
 - `code-review.collect-context` *(implemented)*
   - Inputs: optional working directory, flags for git status and recent commit inclusion.
   - Output: repository root, branch divergence, staged/unstaged breakdown, optional recent commits.
+- `code-review.diff-insights` *(implemented)*
+  - Inputs: selection of staged vs working tree, optional path subset, patch inclusion toggle.
+  - Output: per-file churn metrics, rename tracking, totals, and optional patch excerpts.
 - `code-review.diff-insights`
   - Inputs: explicit diff or reference to staged changes.
   - Output: per-file change summary, churn metrics, language classification.
