@@ -27,6 +27,16 @@ type DiffInsightsArgs = {
   maxPatchLines: number;
 };
 
+type HeuristicArgs = {
+  workingDirectory?: string;
+  source: DiffSource;
+  paths?: string[];
+  largeFileThreshold: number;
+  requireTestsForCode: boolean;
+  includePatchContextLines: number;
+  warnOnConfigChanges: boolean;
+};
+
 type RepoStatus = {
   branch?: string;
   upstream?: string;
@@ -61,6 +71,36 @@ type DiffInsights = {
   totalAdditions: number;
   totalDeletions: number;
   files: DiffFileChange[];
+};
+
+type FindingSeverity = 'info' | 'warn' | 'critical';
+type FindingCategory = 'testing' | 'risk' | 'dependencies' | 'maintenance' | 'general';
+
+type ReviewFinding = {
+  id: string;
+  category: FindingCategory;
+  severity: FindingSeverity;
+  summary: string;
+  details: string;
+  affectedFiles: string[];
+  recommendation?: string;
+};
+
+type HeuristicReport = {
+  repositoryRoot: string;
+  source: DiffSource;
+  metrics: {
+    fileCount: number;
+    totalAdditions: number;
+    totalDeletions: number;
+    largeFiles: number;
+    binaryFiles: number;
+    codeFiles: number;
+    testFiles: number;
+  };
+  findings: ReviewFinding[];
+  suggestions: string[];
+  diff: DiffInsights;
 };
 
 const collectContextInputSchema = {
@@ -112,6 +152,45 @@ const diffInsightsInputSchema = {
     .max(2000)
     .default(400)
     .describe('Maximum number of patch lines retained when includePatch is true.'),
+};
+
+const runHeuristicsInputSchema = {
+  workingDirectory: z
+    .string()
+    .min(1)
+    .describe('Absolute or relative path whose repository heuristics should run against.')
+    .optional(),
+  source: z
+    .enum(['staged', 'working'] as const)
+    .default('staged')
+    .describe('Analyse staged/index diff or working tree vs HEAD.'),
+  paths: z
+    .array(z.string().min(1))
+    .min(1)
+    .describe('Optional subset of paths to focus on. Defaults to all changed files.')
+    .optional(),
+  largeFileThreshold: z
+    .number()
+    .int()
+    .min(50)
+    .max(5000)
+    .default(400)
+    .describe('Total added+deleted line count per file above which a warning is emitted.'),
+  requireTestsForCode: z
+    .boolean()
+    .default(true)
+    .describe('Warn when code changes lack accompanying test modifications.'),
+  includePatchContextLines: z
+    .number()
+    .int()
+    .min(50)
+    .max(2000)
+    .default(400)
+    .describe('Patch context retained for heuristic inspection and output.'),
+  warnOnConfigChanges: z
+    .boolean()
+    .default(true)
+    .describe('Elevate configuration / dependency file edits to explicit findings.'),
 };
 
 async function main() {
@@ -232,11 +311,65 @@ async function main() {
     }
   );
 
+  server.registerTool(
+    'code-review.run-heuristics',
+    {
+      title: 'Evaluate review heuristics',
+      description:
+        'Apply opinionated checks (missing tests, large changes, config edits) on the current diff to guide human reviewers.',
+      inputSchema: runHeuristicsInputSchema,
+    },
+    async (rawArgs) => {
+      const args = normalizeHeuristicArgs(rawArgs);
+
+      try {
+        const cwd = await resolveWorkingDirectory(args.workingDirectory);
+        const repoRoot = await detectRepositoryRoot(cwd);
+        const diffArgs: DiffInsightsArgs = {
+          workingDirectory: repoRoot,
+          source: args.source,
+          paths: args.paths,
+          includePatch: true,
+          maxPatchLines: args.includePatchContextLines,
+        };
+
+        const diff = await gatherDiffInsights(repoRoot, diffArgs);
+        const report = evaluateHeuristics(diff, args);
+        const summary = formatHeuristicSummary(report);
+
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: summary,
+            },
+            {
+              type: 'text' as const,
+              text: JSON.stringify(report, null, 2),
+            },
+          ],
+          structuredContent: report,
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `code-review.run-heuristics failed: ${message}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
   const transport = new StdioServerTransport();
   console.error('Code Review MCP server starting...');
   await server.connect(transport);
   console.error(
-    'Code Review MCP server ready. Registered tools: code-review.collect-context, code-review.diff-insights'
+    'Code Review MCP server ready. Registered tools: code-review.collect-context, code-review.diff-insights, code-review.run-heuristics'
   );
 }
 
@@ -256,6 +389,18 @@ function normalizeDiffInsightsArgs(raw: Partial<DiffInsightsArgs> | undefined): 
     paths: raw?.paths,
     includePatch: raw?.includePatch ?? false,
     maxPatchLines: raw?.maxPatchLines ?? 400,
+  };
+}
+
+function normalizeHeuristicArgs(raw: Partial<HeuristicArgs> | undefined): HeuristicArgs {
+  return {
+    workingDirectory: raw?.workingDirectory,
+    source: raw?.source ?? 'staged',
+    paths: raw?.paths,
+    largeFileThreshold: raw?.largeFileThreshold ?? 400,
+    requireTestsForCode: raw?.requireTestsForCode ?? true,
+    includePatchContextLines: raw?.includePatchContextLines ?? 400,
+    warnOnConfigChanges: raw?.warnOnConfigChanges ?? true,
   };
 }
 
@@ -661,6 +806,216 @@ function buildPatchAppendix(insights: DiffInsights): string | undefined {
 
 function normalizePathForComparison(p: string): string {
   return path.posix.normalize(p.replace(/\\/g, '/'));
+}
+
+function evaluateHeuristics(diff: DiffInsights, args: HeuristicArgs): HeuristicReport {
+  const findings: ReviewFinding[] = [];
+  const codeFiles = diff.files.filter(isCodeFileChange);
+  const testFiles = diff.files.filter(isTestFileChange);
+  const binaryFiles = diff.files.filter((file) => file.isBinary);
+  const largeFiles = diff.files.filter((file) => !file.isBinary && totalChurn(file) >= args.largeFileThreshold);
+  const configFiles = diff.files.filter(isConfigChange);
+
+  if (largeFiles.length) {
+    findings.push({
+      id: 'large-files',
+      category: 'risk',
+      severity: 'warn',
+      summary: `${largeFiles.length} file(s) exceed the ${args.largeFileThreshold} line churn threshold`,
+      details: largeFiles
+        .map(
+          (file) =>
+            `${file.path}: +${file.additions ?? 0} / -${file.deletions ?? 0} (${totalChurn(file)} lines total)`
+        )
+        .join('\n'),
+      affectedFiles: largeFiles.map((file) => file.path),
+      recommendation: 'Consider breaking up the change or highlighting key areas for reviewers.',
+    });
+  }
+
+  if (args.requireTestsForCode && codeFiles.length && !testFiles.length) {
+    findings.push({
+      id: 'missing-tests',
+      category: 'testing',
+      severity: 'warn',
+      summary: 'Code changes detected without corresponding test updates',
+      details:
+        'At least one source file changed, but no files matching common test naming patterns were modified.',
+      affectedFiles: codeFiles.map((file) => file.path),
+      recommendation: 'Add or update tests covering the changed behaviour, or document why tests are not required.',
+    });
+  }
+
+  if (args.warnOnConfigChanges && configFiles.length) {
+    findings.push({
+      id: 'config-edits',
+      category: 'dependencies',
+      severity: 'info',
+      summary: 'Configuration or dependency files were modified',
+      details: configFiles.map((file) => file.path).join('\n'),
+      affectedFiles: configFiles.map((file) => file.path),
+      recommendation:
+        'Ensure reviewers understand the impact of configuration changes and confirm lockfiles remain consistent.',
+    });
+  }
+
+  if (binaryFiles.length) {
+    findings.push({
+      id: 'binary-files',
+      category: 'maintenance',
+      severity: 'info',
+      summary: `${binaryFiles.length} binary file(s) changed`,
+      details: binaryFiles.map((file) => file.path).join('\n'),
+      affectedFiles: binaryFiles.map((file) => file.path),
+      recommendation: 'Verify binary assets are intentional and document update rationale.',
+    });
+  }
+
+  const suggestions = deriveSuggestions(findings, diff);
+
+  return {
+    repositoryRoot: diff.repositoryRoot,
+    source: diff.source,
+    metrics: {
+      fileCount: diff.fileCount,
+      totalAdditions: diff.totalAdditions,
+      totalDeletions: diff.totalDeletions,
+      largeFiles: largeFiles.length,
+      binaryFiles: binaryFiles.length,
+      codeFiles: codeFiles.length,
+      testFiles: testFiles.length,
+    },
+    findings,
+    suggestions,
+    diff,
+  };
+}
+
+function totalChurn(file: DiffFileChange): number {
+  return (file.additions ?? 0) + (file.deletions ?? 0);
+}
+
+function isCodeFileChange(file: DiffFileChange): boolean {
+  const ext = path.extname(file.path).toLowerCase();
+  if (!ext) {
+    return false;
+  }
+  const codeExtensions = new Set([
+    '.ts',
+    '.tsx',
+    '.js',
+    '.jsx',
+    '.mjs',
+    '.cjs',
+    '.py',
+    '.java',
+    '.kt',
+    '.go',
+    '.rs',
+    '.cpp',
+    '.c',
+    '.cs',
+    '.rb',
+    '.php',
+    '.swift',
+  ]);
+  return codeExtensions.has(ext) && !isTestFileChange(file);
+}
+
+function isTestFileChange(file: DiffFileChange): boolean {
+  const normalized = normalizePathForComparison(file.path);
+  return (
+    normalized.includes('/test/') ||
+    normalized.includes('/tests/') ||
+    normalized.includes('/__tests__/') ||
+    /\.test\.[^.]+$/.test(normalized) ||
+    /\.spec\.[^.]+$/.test(normalized) ||
+    normalized.endsWith('-test.ts') ||
+    normalized.endsWith('-spec.ts')
+  );
+}
+
+function isConfigChange(file: DiffFileChange): boolean {
+  const basename = path.basename(file.path);
+  const configNames = new Set([
+    'package.json',
+    'package-lock.json',
+    'pnpm-lock.yaml',
+    'yarn.lock',
+    'tsconfig.json',
+    'pyproject.toml',
+    'requirements.txt',
+    'go.mod',
+    'go.sum',
+    'pom.xml',
+    'build.gradle',
+    'Dockerfile',
+  ]);
+  if (configNames.has(basename)) {
+    return true;
+  }
+  if (basename.endsWith('.env') || basename.endsWith('.env.example')) {
+    return true;
+  }
+  const normalized = normalizePathForComparison(file.path);
+  return (
+    normalized.startsWith('.github/workflows/') ||
+    normalized.includes('/config/') ||
+    normalized.includes('/configs/') ||
+    normalized.includes('/infrastructure/')
+  );
+}
+
+function deriveSuggestions(findings: ReviewFinding[], diff: DiffInsights): string[] {
+  const suggestions: string[] = [];
+  if (!findings.length) {
+    suggestions.push('No heuristic findings detected. Proceed with focused manual review.');
+  }
+  if (!diff.fileCount) {
+    suggestions.push('Diff is empty. Confirm you staged or saved the desired changes.');
+  }
+  const hasLarge = findings.some((f) => f.id === 'large-files');
+  if (hasLarge) {
+    suggestions.push('Highlight the riskiest regions in review description or break up the PR.');
+  }
+  const missingTests = findings.some((f) => f.id === 'missing-tests');
+  if (missingTests) {
+    suggestions.push('Add regression tests or document why tests are not applicable.');
+  }
+  return suggestions;
+}
+
+function formatHeuristicSummary(report: HeuristicReport): string {
+  const lines: string[] = [];
+  lines.push(
+    `Heuristic scan for ${
+      report.source === 'staged' ? 'staged changes' : 'working tree'
+    } at ${report.repositoryRoot}`
+  );
+  lines.push(
+    `Files: ${report.metrics.fileCount}, churn +${report.metrics.totalAdditions} / -${report.metrics.totalDeletions}`
+  );
+  lines.push(
+    `Code files: ${report.metrics.codeFiles}, tests: ${report.metrics.testFiles}, binary: ${report.metrics.binaryFiles}`
+  );
+
+  if (!report.findings.length) {
+    lines.push('No heuristic findings.');
+  } else {
+    lines.push('Findings:');
+    for (const finding of report.findings) {
+      lines.push(`- [${finding.severity.toUpperCase()}] ${finding.summary}`);
+    }
+  }
+
+  if (report.suggestions.length) {
+    lines.push('\nNext steps:');
+    for (const suggestion of report.suggestions) {
+      lines.push(`- ${suggestion}`);
+    }
+  }
+
+  return lines.join('\n');
 }
 
 main().catch((error) => {

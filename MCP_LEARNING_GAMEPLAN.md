@@ -19,6 +19,9 @@
 - `code-review.diff-insights` *(implemented)*
   - Inputs: selection of staged vs working tree, optional path subset, patch inclusion toggle.
   - Output: per-file churn metrics, rename tracking, totals, and optional patch excerpts.
+- `code-review.run-heuristics` *(implemented)*
+  - Inputs: diff source, optional path focus, churn threshold configuration.
+  - Output: categorised findings (risk, testing, dependencies) with actionable reviewer follow-ups.
 - `code-review.diff-insights`
   - Inputs: explicit diff or reference to staged changes.
   - Output: per-file change summary, churn metrics, language classification.

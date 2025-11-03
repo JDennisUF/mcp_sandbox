@@ -29,6 +29,7 @@ When running inside VS Code, wire the server up via your preferred MCP client (e
 
 - `code-review.collect-context` — returns repository root, branch divergence, staged/unstaged breakdown, and optional recent commits to seed downstream review heuristics.
 - `code-review.diff-insights` — summarises staged or working tree diffs, including churn metrics, rename tracking, and optional patch excerpts.
+- `code-review.run-heuristics` — scores the diff for large changes, missing tests, config edits, and other review prompts, returning structured findings and next-step suggestions.
 
 ## Repository Layout
 
